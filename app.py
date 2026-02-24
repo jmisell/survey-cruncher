@@ -4,7 +4,7 @@ import io
 
 # --- PAGE SETUP ---
 st.set_page_config(page_title="Survey Cruncher", layout="wide")
-st.title("📊 Survey Data Cruncher (Version 4.3)")
+st.title("📊 Survey Data Cruncher (Version 4.4)")
 st.write("Upload your raw survey data to generate clean tables.")
 
 # --- FILE UPLOAD ---
@@ -66,25 +66,19 @@ if uploaded_file is not None:
                     value_name='Answer'
                 )
                 
-                # --- NEW REFINEMENT: THE ROBUST SCRUBBER ---
-                # Drop real nulls
+                # --- THE ROBUST SCRUBBER ---
                 long_data = long_data.dropna(subset=['Answer'])
-                
-                # Convert to string and strip invisible spaces from the answers
                 long_data['Question'] = long_data['Question'].astype(str)
                 long_data['Answer'] = long_data['Answer'].astype(str).str.strip()
                 
-                # Destroy "ghost" blanks left by SurveyMonkey
                 ghost_blanks = ['nan', 'None', '', '-', 'NaN', '<NA>']
                 long_data = long_data[~long_data['Answer'].isin(ghost_blanks)]
-                # -------------------------------------------
 
                 # --- MULTICODE SPLITTING ---
                 if split_multicode:
                     long_data['Answer'] = long_data['Answer'].str.split(',')
                     long_data = long_data.explode('Answer')
                     long_data['Answer'] = long_data['Answer'].str.strip()
-                    # One final scrub in case the splitting created new blanks
                     long_data = long_data[~long_data['Answer'].isin(ghost_blanks)]
                 
                 # --- PRESERVE ORIGINAL ORDER ---
@@ -100,11 +94,10 @@ if uploaded_file is not None:
                     categories=unique_answers, 
                     ordered=True
                 )
-                # -----------------------------------------------
 
                 tables_to_join = []
                 
-                # 2. OVERALL PERCENTAGES (Dynamic base size!)
+                # 2. OVERALL PERCENTAGES
                 overall = pd.crosstab(index=[long_data['Question'], long_data['Answer']], columns='Overall %', dropna=True)
                 overall_bases = long_data.groupby('Question', observed=True)[id_col].nunique()
                 overall_pct = overall.div(overall_bases, level='Question', axis=0) * 100
@@ -134,7 +127,6 @@ if uploaded_file is not None:
                     for cat, count in counts.items():
                         base_sizes[f"{col}: {str(cat)}"] = count
                         
-                # Renamed label to distinguish from question-level bases
                 base_index = pd.MultiIndex.from_tuples([("BASE SIZE", "Total Survey Participants (n)")], names=['Question', 'Answer'])
                 base_df = pd.DataFrame([base_sizes], index=base_index)
                 
@@ -143,10 +135,14 @@ if uploaded_file is not None:
                 # --- FINAL CLEANUP ---
                 final_report = final_report.reset_index()
                 
-                # --- FORCE FINAL SORTING TO PREVENT ALPHABETIZING ---
+                # Sort it using the strict Categories
                 final_report['Question'] = pd.Categorical(final_report['Question'], categories=(['BASE SIZE'] + question_cols), ordered=True)
                 final_report = final_report.sort_values(['Question'])
                 
+                # NEW FIX: Unlock the column back to normal text so it allows blank spaces!
+                final_report['Question'] = final_report['Question'].astype(str)
+                
+                # Now we can safely blank out the duplicates
                 final_report.loc[final_report['Question'].duplicated(), 'Question'] = ""
                 
                 st.success("✨ Analysis Complete!")
