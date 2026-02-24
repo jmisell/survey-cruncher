@@ -4,14 +4,13 @@ import io
 
 # --- PAGE SETUP ---
 st.set_page_config(page_title="Survey Cruncher", layout="wide")
-st.title("📊 Survey Data Cruncher")
+st.title("📊 Survey Data Cruncher (Version 4.3)")
 st.write("Upload your raw survey data to generate clean tables.")
 
 # --- FILE UPLOAD ---
 uploaded_file = st.file_uploader("Upload Raw Survey Data (Excel or CSV)", type=["xlsx", "csv"])
 
 if uploaded_file is not None:
-    # Read the file depending on its type
     if uploaded_file.name.endswith('.csv'):
         df = pd.read_csv(uploaded_file)
     else:
@@ -22,7 +21,7 @@ if uploaded_file is not None:
     st.write(f"**Total Respondents:** {df.shape[0]}")
     st.write(f"**Total Columns:** {df.shape[1]}")
     
-    with st.expander("Show Raw Data Preview"):
+    with st.expander("Show Raw Data Preview (Check your columns here!)"):
         st.dataframe(df.head(10)) 
 
     # --- MAPPING COLUMNS ---
@@ -32,24 +31,16 @@ if uploaded_file is not None:
     all_columns = df.columns.tolist()
     
     id_col = st.selectbox("1. Select the Response ID column:", all_columns)
-    
-    demo_cols = st.multiselect(
-        "2. Select Demographic/Banner columns (e.g., Region, Gender):", 
-        all_columns
-    )
+    demo_cols = st.multiselect("2. Select Demographic/Banner columns (e.g., Region, Gender):", all_columns)
     
     remaining_cols = [col for col in all_columns if col not in demo_cols and col != id_col]
     
-    question_cols = st.multiselect(
-        "3. Select the Question columns you want to analyze:", 
-        remaining_cols
-    )
+    question_cols = st.multiselect("3. Select the Question columns you want to analyze:", remaining_cols)
 
-    # --- NEW OPTION: MULTICODE SPLITTER ---
+    # --- CONFIGURATION ---
     st.divider()
     st.subheader("Step 2: Configuration")
     
-    # The new checkbox for handling comma-separated answers
     split_multicode = st.checkbox(
         "My data contains multi-select answers separated by commas (e.g., 'Apple, Banana')",
         value=False,
@@ -64,7 +55,7 @@ if uploaded_file is not None:
         if not demo_cols or not question_cols:
             st.warning("⚠️ Please select at least one demographic and one question column above.")
         else:
-            with st.spinner("Unpivoting and calculating percentages... (this takes milliseconds!)"):
+            with st.spinner("Scrubbing data and calculating percentages..."):
                 
                 # 1. UNPIVOTING THE DATA
                 long_data = pd.melt(
@@ -75,66 +66,67 @@ if uploaded_file is not None:
                     value_name='Answer'
                 )
                 
-                # Clean up: remove blank answers
+                # --- NEW REFINEMENT: THE ROBUST SCRUBBER ---
+                # Drop real nulls
                 long_data = long_data.dropna(subset=['Answer'])
                 
-                # Force everything to string to prevent crashes
+                # Convert to string and strip invisible spaces from the answers
                 long_data['Question'] = long_data['Question'].astype(str)
-                long_data['Answer'] = long_data['Answer'].astype(str)
-
-                # --- NEW LOGIC: HANDLE MULTICODE SPLITTING ---
-                if split_multicode:
-                    # 1. Split by comma (creates a list: ['Apple', ' Banana'])
-                    long_data['Answer'] = long_data['Answer'].str.split(',')
-                    # 2. Explode the list into separate rows
-                    long_data = long_data.explode('Answer')
-                    # 3. Trim whitespace (removes the space before ' Banana')
-                    long_data['Answer'] = long_data['Answer'].str.strip()
-                # ---------------------------------------------
+                long_data['Answer'] = long_data['Answer'].astype(str).str.strip()
                 
-                # 2. BUILDING THE BANNER TABLES
+                # Destroy "ghost" blanks left by SurveyMonkey
+                ghost_blanks = ['nan', 'None', '', '-', 'NaN', '<NA>']
+                long_data = long_data[~long_data['Answer'].isin(ghost_blanks)]
+                # -------------------------------------------
+
+                # --- MULTICODE SPLITTING ---
+                if split_multicode:
+                    long_data['Answer'] = long_data['Answer'].str.split(',')
+                    long_data = long_data.explode('Answer')
+                    long_data['Answer'] = long_data['Answer'].str.strip()
+                    # One final scrub in case the splitting created new blanks
+                    long_data = long_data[~long_data['Answer'].isin(ghost_blanks)]
+                
+                # --- PRESERVE ORIGINAL ORDER ---
+                long_data['Question'] = pd.Categorical(
+                    long_data['Question'], 
+                    categories=question_cols, 
+                    ordered=True
+                )
+                
+                unique_answers = long_data['Answer'].unique().tolist()
+                long_data['Answer'] = pd.Categorical(
+                    long_data['Answer'], 
+                    categories=unique_answers, 
+                    ordered=True
+                )
+                # -----------------------------------------------
+
                 tables_to_join = []
                 
-                # Create the 'Overall %' column
-                overall = pd.crosstab(index=[long_data['Question'], long_data['Answer']], columns='Overall %')
-                
-                # IMPORTANT: Calculate percentage based on UNIQUE respondents (Base Size), not row count
-                # This ensures multi-code percentages are correct (can sum > 100%)
-                total_respondents = df[id_col].nunique()
-                overall_pct = (overall / total_respondents) * 100
-                
+                # 2. OVERALL PERCENTAGES (Dynamic base size!)
+                overall = pd.crosstab(index=[long_data['Question'], long_data['Answer']], columns='Overall %', dropna=True)
+                overall_bases = long_data.groupby('Question', observed=True)[id_col].nunique()
+                overall_pct = overall.div(overall_bases, level='Question', axis=0) * 100
                 tables_to_join.append(overall_pct)
                 
-                # Create a column for every demographic selected
+                # 3. DEMOGRAPHIC PERCENTAGES
                 for col in demo_cols:
-                    prefixed_demo = col + ": " + df[col].astype(str)
-                    
-                    # We need to join the demographic info back to the exploded data to get the right counts
-                    # But since long_data already has the demo cols, we can just use them!
-                    
-                    # Calculate counts for this subgroup
-                    # We use the demographic column from long_data which is aligned with the answers
                     demo_tab = pd.crosstab(
                         index=[long_data['Question'], long_data['Answer']], 
-                        columns=long_data[col]
+                        columns=long_data[col],
+                        dropna=True
                     )
                     
-                    # Calculate base sizes for this specific demographic group from the ORIGINAL dataframe
-                    # This ensures the denominator is "Total People in Group", not "Total Answers Given"
-                    demo_bases = df.groupby(col)[id_col].nunique()
-                    
-                    # Divide counts by the correct base size
-                    demo_pct = demo_tab.div(demo_bases, axis=1) * 100
-                    
-                    # Rename columns to include the prefix (e.g., "Gender: Male")
-                    demo_pct.columns = [f"{col}: {c}" for c in demo_pct.columns]
-                    
+                    demo_bases = long_data.groupby(['Question', col], observed=True)[id_col].nunique().unstack(level=col)
+                    demo_pct = demo_tab.div(demo_bases, level='Question', axis=0) * 100
+                    demo_pct.columns = [f"{col}: {str(c)}" for c in demo_pct.columns]
                     tables_to_join.append(demo_pct)
                     
-                # 3. GLUE THEM ALL TOGETHER
+                # 4. GLUE THEM ALL TOGETHER
                 final_report = pd.concat(tables_to_join, axis=1).fillna(0).round(1)
                 
-                # --- ADD BASE SIZES (n) ROW ---
+                # --- ADD TOP BASE SIZES (n) ROW ---
                 base_sizes = {'Overall %': df[id_col].nunique()}
                 
                 for col in demo_cols:
@@ -142,20 +134,26 @@ if uploaded_file is not None:
                     for cat, count in counts.items():
                         base_sizes[f"{col}: {str(cat)}"] = count
                         
-                base_index = pd.MultiIndex.from_tuples([("BASE SIZE", "Base (n)")], names=['Question', 'Answer'])
+                # Renamed label to distinguish from question-level bases
+                base_index = pd.MultiIndex.from_tuples([("BASE SIZE", "Total Survey Participants (n)")], names=['Question', 'Answer'])
                 base_df = pd.DataFrame([base_sizes], index=base_index)
                 
                 final_report = pd.concat([base_df, final_report]).fillna(0)
                 
                 # --- FINAL CLEANUP ---
                 final_report = final_report.reset_index()
+                
+                # --- FORCE FINAL SORTING TO PREVENT ALPHABETIZING ---
+                final_report['Question'] = pd.Categorical(final_report['Question'], categories=(['BASE SIZE'] + question_cols), ordered=True)
+                final_report = final_report.sort_values(['Question'])
+                
                 final_report.loc[final_report['Question'].duplicated(), 'Question'] = ""
                 
                 st.success("✨ Analysis Complete!")
                 st.write("### Your Final Banner Table (Percentages %)")
                 st.dataframe(final_report)
                 
-                # 4. EXCEL DOWNLOAD
+                # 5. EXCEL DOWNLOAD
                 excel_buffer = io.BytesIO()
                 with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
                     final_report.to_excel(writer, sheet_name='Survey Results', index=False)
@@ -167,4 +165,3 @@ if uploaded_file is not None:
                     file_name="Clean_Survey_Results.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
-                
